@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+import concurrent.futures
+import csv
+import os
+import random
+import sys
+import time
+from typing import List, Dict, Any, Tuple, Optional
+
+import requests
+import warnings
+import urllib3
+
+TEST_URL_DEFAULT = "https://api64.ipify.org?format=json"
+
+
+def normalize_proxy(p: str, default_scheme: str = "http") -> str:
+    p = p.strip()
+    if not p:
+        return p
+    lowered = p.lower()
+    if lowered.startswith(("http://", "https://", "socks4://", "socks5://")):
+        return p
+    return f"{default_scheme}://{p}"
+
+
+def read_proxies(path: str, default_scheme: str = "http", shuffle: bool = True) -> List[str]:
+    if not os.path.exists(path):
+        print(f"[ERROR] proxy file not found: {path}")
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        lines = [normalize_proxy(line, default_scheme=default_scheme) for line in f if line.strip()]
+    seen, uniq = set(), []
+    for x in lines:
+        if x not in seen:
+            seen.add(x)
+            uniq.append(x)
+    if shuffle:
+        random.shuffle(uniq)
+    return uniq
+
+
+def check_single_proxy(
+    proxy: str,
+    timeout: float = 6.0,
+    retries: int = 1,
+    strict_ssl: bool = False,
+    test_url: str = TEST_URL_DEFAULT,
+) -> Tuple[str, bool, Optional[float], Optional[str], Optional[str]]:
+    """
+    Return: (proxy, is_alive, latency, ip_seen, error)
+    strict_ssl=True -> verify=True (ketat)
+    strict_ssl=False -> verify=False (longgar)
+    """
+    proxies = {"http": proxy, "https": proxy}
+    last_err = None
+    for _ in range(retries + 1):
+        t0 = time.perf_counter()
+        try:
+            r = requests.get(
+                test_url,
+                proxies=proxies,
+                timeout=timeout,
+                verify=strict_ssl,  # strict=True -> verify cert
+            )
+            latency = round(time.perf_counter() - t0, 3)
+            if r.status_code == 200 and r.text.strip():
+                try:
+                    ip_seen = r.json().get("ip")
+                except Exception:
+                    ip_seen = r.text.strip()
+                return (proxy, True, latency, ip_seen, None)
+            else:
+                last_err = f"bad status {r.status_code}"
+        except Exception as e:
+            last_err = str(e)
+    return (proxy, False, None, None, last_err)
+
+
+def ip_api_lookup(ip: str) -> Dict[str, Any]:
+    """
+    ip-api.com (gratis, no key). Rate-limit wajar.
+    """
+    try:
+        r = requests.get(f"http://ip-api.com/json/{ip}", timeout=5)
+        if r.status_code == 200:
+            return r.json()
+        return {"status": "fail", "message": f"HTTP {r.status_code}"}
+    except Exception as e:
+        return {"status": "fail", "message": str(e)}
+
+
+def write_txt(path: str, items: List[str]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        for it in items:
+            f.write(it + "\n")
+
+
+def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
+    fieldnames = [
+        "proxy", "ip", "latency",
+        "country", "regionName", "city",
+        "isp", "as"
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow({
+                "proxy": r.get("proxy"),
+                "ip": r.get("ip"),
+                "latency": r.get("latency"),
+                "country": r.get("country"),
+                "regionName": r.get("regionName"),
+                "city": r.get("city"),
+                "isp": r.get("isp"),
+                "as": r.get("as"),
+            })
+
+
+def parse_list_arg(value: Optional[str]) -> Optional[List[str]]:
+    if not value:
+        return None
+    parts = [x.strip() for x in value.split(",") if x.strip()]
+    return parts or None
+
+
+def filter_alive(
+    rows: List[Dict[str, Any]],
+    country_allow: Optional[List[str]] = None,
+    isp_allow: Optional[List[str]] = None,
+    isp_deny: Optional[List[str]] = None,
+    max_latency: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    def ok(row: Dict[str, Any]) -> bool:
+        if max_latency is not None and row.get("latency") is not None:
+            if row["latency"] > max_latency:
+                return False
+
+        if country_allow:
+            c = (row.get("country") or "").upper()
+            allow_upper = [x.upper() for x in country_allow]
+            if c not in allow_upper:
+                return False
+
+        isp = row.get("isp") or ""
+        isp_upper = isp.upper()
+        if isp_allow:
+            allow = [x.upper() for x in isp_allow]
+            if all(k not in isp_upper for k in allow):
+                return False
+
+        if isp_deny:
+            deny = [x.upper() for x in isp_deny]
+            if any(k in isp_upper for k in deny):
+                return False
+
+        return True
+
+    return [r for r in rows if ok(r)]
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Check proxies (alive/latency) + optional strict SSL + enrich ip-api + sorting & filtering"
+    )
+    p.add_argument("-i", "--input", default="proxy.txt", help="Proxy list input (default: proxy.txt)")
+    p.add_argument("-a", "--alive-out", default="alive.txt", help="Alive proxies output (default: alive.txt)")
+    p.add_argument("-d", "--dead-out", default="dead.txt", help="Dead proxies output (default: dead.txt)")
+    p.add_argument("-c", "--csv-out", default="alive.csv", help="CSV output with details (default: alive.csv)")
+    p.add_argument("-w", "--workers", type=int, default=20, help="Thread workers (default: 20)")
+    p.add_argument("-t", "--timeout", type=float, default=6.0, help="Timeout seconds (default: 6)")
+    p.add_argument("-r", "--retries", type=int, default=1, help="Retries per proxy (default: 1)")
+    p.add_argument("--no-shuffle", action="store_true", help="Do not shuffle input proxies")
+    p.add_argument("--default-scheme", choices=["http", "https", "socks4", "socks5"], default="http",
+                   help="Scheme for proxies without scheme (default: http)")
+    p.add_argument("--update", action="store_true", help="Rewrite input file to alive proxies only")
+    p.add_argument("--strict-ssl", action="store_true",
+                   help="Enable strict SSL verification (verify=True). Default off (verify=False)")
+    p.add_argument("--sort-by", choices=["latency", "country", "isp"], default="latency",
+                   help="Sort alive proxies (default: latency)")
+    # Filtering
+    p.add_argument("--country-allow", default=None,
+                   help="Keep only countries (ISO name) e.g. 'ID,SG,US'")
+    p.add_argument("--isp-allow", default=None,
+                   help="Keep only proxies whose ISP contains any of these keywords (comma-separated)")
+    p.add_argument("--isp-deny", default=None,
+                   help="Drop proxies whose ISP contains any of these keywords (comma-separated)")
+    p.add_argument("--max-latency", type=float, default=None,
+                   help="Keep only proxies with latency <= this value (seconds)")
+
+    args = p.parse_args()
+
+    # Suppress warnings when not strict (verify=False)
+    if not args.strict_ssl:
+        warnings.filterwarnings("ignore", category=UserWarning)
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    proxies = read_proxies(args.input, default_scheme=args.default_scheme, shuffle=not args.no_shuffle)
+    if not proxies:
+        print("[WARN] No proxies loaded")
+        sys.exit(1)
+
+    print(f"[INFO] Loaded {len(proxies)} proxies from {args.input}")
+    print(f"[INFO] Mode: {'STRICT SSL' if args.strict_ssl else 'RELAXED SSL'} | workers={args.workers}, timeout={args.timeout}s, retries={args.retries}")
+
+    alive: List[Dict[str, Any]] = []
+    dead: List[str] = []
+
+    # Liveness check
+    start = time.perf_counter()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
+        futs = [
+            ex.submit(check_single_proxy, pxy, args.timeout, args.retries, args.strict_ssl, TEST_URL_DEFAULT)
+            for pxy in proxies
+        ]
+        for fut in concurrent.futures.as_completed(futs):
+            proxy, ok, latency, ip_seen, err = fut.result()
+            if ok:
+                entry = {"proxy": proxy, "ip": ip_seen, "latency": latency}
+                alive.append(entry)
+                print(f"[OK]   {proxy:<40} {latency:>5}s ip={ip_seen}")
+            else:
+                dead.append(proxy)
+                print(f"[DOWN] {proxy:<40} reason={err}")
+
+    # Enrich with ip-api (free)
+    print("[INFO] Enriching alive IPs with ip-api.com ...")
+    for entry in alive:
+        if entry.get("ip"):
+            data = ip_api_lookup(entry["ip"])
+            # keep only useful keys
+            entry["country"] = data.get("country")
+            entry["regionName"] = data.get("regionName")
+            entry["city"] = data.get("city")
+            entry["isp"] = data.get("isp")
+            entry["as"] = data.get("as")
+
+    # Filtering (optional)
+    alive_before = len(alive)
+    alive = filter_alive(
+        alive,
+        country_allow=parse_list_arg(args.country_allow),
+        isp_allow=parse_list_arg(args.isp_allow),
+        isp_deny=parse_list_arg(args.isp_deny),
+        max_latency=args.max_latency,
+    )
+    if alive_before != len(alive):
+        print(f"[FILTER] {alive_before} -> {len(alive)} after filters")
+
+    # Sorting
+    if args.sort_by == "latency":
+        alive.sort(key=lambda x: (x.get("latency", 9999.0), x.get("country") or "", x.get("isp") or ""))
+    elif args.sort_by == "country":
+        alive.sort(key=lambda x: ((x.get("country") or "ZZZ").upper(), x.get("latency", 9999.0)))
+    elif args.sort_by == "isp":
+        alive.sort(key=lambda x: ((x.get("isp") or "ZZZ").upper(), x.get("latency", 9999.0)))
+
+    dur = round(time.perf_counter() - start, 3)
+    print("-" * 60)
+    print(f"[DONE] Alive: {len(alive)} | Dead: {len(dead)} | Time: {dur}s")
+
+    # Save outputs
+    write_txt(args.alive_out, [e["proxy"] for e in alive])
+    write_txt(args.dead_out, dead)
+    write_csv(args.csv_out, alive)
+    print(f"[SAVE] {args.alive_out}, {args.dead_out}, {args.csv_out}")
+
+    if args.update:
+        write_txt(args.input, [e["proxy"] for e in alive])
+        print(f"[UPDATE] {args.input} overwritten with {len(alive)} alive proxies")
+
+
+if __name__ == "__main__":
+    main()
